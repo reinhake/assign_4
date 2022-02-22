@@ -7,78 +7,174 @@
 #include <semaphore.h>
 #include <string.h>
 #include <fcntl.h>
+#include <assert.h>
+#include <signal.h>
 
+//Golabal variable to track when input it finished
+volatile sig_atomic_t gEndFunction = 0;
+
+//struct for the different buffers using semaphores
 struct targs {
   sem_t *sem; /* semaphore */
-  char *shm; /* shared memory */ 
-  size_t shm_sz; /* size of shared memory */
+  char *shm; /* shared memory */
 };
 
-char* getLineInput(){
-    char line[1000];
+//first buffer with producer getInput and consumer replaceNewLine
+struct targs targ1;
+sem_t sem1;
+
+//second buffer with producer replaceNewLine and consumer replacePlusPlus
+struct targs targ2;
+sem_t sem2;
+
+//third buffer with producer replacePlusPlus and consumer formatLines
+struct targs targ3;
+sem_t sem3;
+
+//helper function for getLineInput that just reads the current input line
+void getLineInput(char* line){
     fgets(line, 1000, stdin);
-    return line;
 }
 
-void getInput(char* outLines){
+//First Thread that cycles through different inputs, stores inputs in the first buffer
+//targ1, and then posts it. Checks for STOP\n to end input
+void* getInput(){
     for(int i = 0; i < 50; i++){
-        char* line = getLineInput();
-        if(strncmp(line, "STOP\n", 5) == 0){
-            i = 50;
+        char tLine[1000];
+        getLineInput(tLine);
+        //adds the input from getf into the first buffer
+        
+        strncat(targ1.shm, tLine, strlen(tLine));
+        if(strncmp(tLine, "STOP\n", 5) == 0){
+            gEndFunction = 1;
+            sem_post(targ1.sem);
+            break;
         }
-        else strncat(outLines, line, strlen(line));
+        //increments the first buffer
+        sem_post(targ1.sem);
     }
+    return NULL;
 }
 
-void replaceNewline(char* lines){
-    char* currPosition = strchr(lines, '\n');
-    while (currPosition){
-        *currPosition = ' ';
-        currPosition = strchr(lines, '\n');
-    }
-}
-
-void replaceplusplus(char* lines){
-    char lines2[strlen(lines)];
-    strcpy(lines2, lines);
-    char* currPosition = strstr(lines, "++");
-    while (currPosition){
-        for(int i = 0; i < strlen(lines2); i++){
-            if(lines2[i] == '+' && lines2[i+1] == '+'){
-                lines2[i] = '%';
-                lines2[i+1] = 's';
-                sprintf(lines, lines2, "^");
-                strcpy(lines2, lines);
+//Second Thread that waits for at least 80 characters to be put in the buffer targ1, and then 
+//starts processing and removes all the '\n' and replaces the with spaces before adding
+//the processed lines to the second buffer targ2 and posts it
+void *replaceNewline(){
+    while(1){
+        //wait for first buffer to increment
+        sem_wait(targ1.sem);
+        char* lines = targ1.shm;
+        //check to see if 80 chars have been posted
+        if(strlen(lines) >= 80 || gEndFunction){
+            //changes all \n into spaces
+            char* currPosition = strchr(lines, '\n');
+            while (currPosition){
+                *currPosition = ' ';
+                currPosition = strchr(lines, '\n');
             }
+            //check if input has ended and add lines to second buffer
+            if(gEndFunction)
+                strncat(targ2.shm, lines, strlen(lines) - 5);
+            else strncat(targ2.shm, lines, strlen(lines));
+            //increment the second buffer and then clear the first
+            sem_post(targ2.sem);
+            strcpy(targ1.shm, "");
         }
-        currPosition = strstr(lines, "++");
     }
+    return NULL;
 }
 
-char **formatLines(char* lines, char* output[]){
-    int alive = 1;
+//Third thread that waits on input from the buffer targ2 and then processes it by
+//replacing ++'s with ^ before adding the process lines into the third buffer targ3
+//and posting it.
+void *replaceplusplus(){
+    while(1){
+        //wait for second buffer to increment
+        sem_wait(targ2.sem);
+        char* lines = targ2.shm;
+        
+        //search for ++'s and replace them with ^
+        char lines2[strlen(lines)];
+        strcpy(lines2, lines);
+        char* currPosition = strstr(lines, "++");
+        while (currPosition){
+            for(int i = 0; i < strlen(lines2); i++){
+                if(lines2[i] == '+' && lines2[i+1] == '+'){
+                    lines2[i] = '%';
+                    lines2[i+1] = 's';
+                    sprintf(lines, lines2, "^");
+                    strcpy(lines2, lines);
+                }
+            }
+            currPosition = strstr(lines, "++");
+        }
+        //copy updated lines to third buffer and increment it,
+        //then clear the second buffer
+        strncat(targ3.shm, lines, strlen(lines));
+        sem_post(targ3.sem);
+        strcpy(targ2.shm, "");
+    }
+    return NULL;
+}
+
+//The fourth thread that waits on input from the buffer targ3, it processes input
+//by parsing the lines into lines that are 80 long and stores them in the two-d array
+//output before then waiting for input to end and printing out the contents of output
+void *formatLines(){
+    //declare a bunch of counters that will keep track of where in ouput new chars
+    //are to be put
+    char* output[625];
     int linePos = 0;
     int rowPos = 0;
-    while(alive){
-        if(linePos + 80 < strlen(lines))
+    int outPos = 0;
+    char lines[50000];
+    
+    while(1){
+        //wait for third buffer to increment
+        sem_wait(targ3.sem);
+
+        //set up first line of output to be copied to
+        strncat(lines, targ3.shm, strlen(targ3.shm));
+        if(rowPos == 0)    
             output[rowPos] = calloc(80, sizeof(char));
-        else output[rowPos] = calloc(strlen(lines)-linePos, sizeof(char));
-        for(int i = 0; i < 80; i++){
-            if(linePos < strlen(lines)){
-                output[rowPos][i] = lines[linePos];
-                linePos++;
+        int alive = 1;
+        
+        //while loops that copy each char from the single long string lines
+        //putting them into 80 char strings in output
+        while(alive){
+            //check current output positions to see if it has reached 80 chars
+            //if 80 chars have been put on this line print it and set up the next line of output
+            if(outPos == 80){
+                outPos = 0;
+                printf("%s\n", output[rowPos]);
+                rowPos++;
+                output[rowPos] = calloc(80, sizeof(char));
             }
-            else {
-                alive = 0;
-                break;
+            //add 80 chars to the currents line of output
+            while(outPos < 80){
+                if(linePos < strlen(lines)){
+                    output[rowPos][outPos] = lines[linePos];
+                    linePos++;
+                    outPos++;
+                }//if there are no new chars to add then break out of the while loops and wait for more
+                else {
+                    alive = 0;
+                    break;
+                } 
             }
         }
-        rowPos++;
+        //check for input being stopped
+        if(gEndFunction){
+            exit(0);
+        }
+        strcpy(targ3.shm, "");
     }
-    return output;
+    
+    return NULL;
 }
 
-void inputFile(char* inputF, char* input){
+//function to open specific inputs 
+void inputFile(char* inputF){
     int source;
     // open scource file
     source = open(inputF, O_RDONLY);
@@ -95,7 +191,8 @@ void inputFile(char* inputF, char* input){
     close(source);
 }
 
-void outputFile(char* outputF, char* input){
+//function to open specific outputs
+void outputFile(char* outputF){
     int source;
     // open scource file
     source = open(outputF, O_WRONLY | O_CREAT | O_TRUNC, 0640);
@@ -115,38 +212,49 @@ void outputFile(char* outputF, char* input){
 
 
 int main(int argc, char *argv[]) {
+    //set up the first buffer to be be 50000 long since the is the maximum allowed input
+    targ1.sem = &sem1;
+    sem_init(&sem1, 0, 0);
+    char buf1[50000];
+    targ1.shm = buf1;
 
-    char inLines[50000];
-    char outLines[625][80];
+    //set up the second buffer to be be 50000 long since the is the maximum allowed input
+    targ2.sem = &sem2;
+    sem_init(&sem2, 0, 0);
+    char buf2[50000];
+    targ2.shm = buf2;
+
+    //set up the third buffer to be be 50000 long since the is the maximum allowed input
+    targ3.sem = &sem3;
+    sem_init(&sem3, 0, 0);
+    char buf3[50000];
+    targ3.shm = buf3;
+
+    //check arguments for specified input and output files
     if( argc >= 3){
         if(strncmp(argv[1], "<", 1) == 0)
-            inputFile(argv[2], inLines);
+            inputFile(argv[2]);
         else if(strncmp(argv[1], ">", 1) == 0)
-            outputFile(argv[2], inLines);
+            outputFile(argv[2]);
         if(argc >= 5){
             if(strncmp(argv[3], "<", 1) == 0)
-                inputFile(argv[4], inLines);
+                inputFile(argv[4]);
             else if(strncmp(argv[3], ">", 1) == 0)
-                outputFile(argv[4], inLines);
-        }
-            
-    }
-    
-    getInput(inLines);
-    
-    replaceNewline(inLines);
-    replaceplusplus(inLines);
-    char **printout = formatLines(inLines, outLines);
-    
-    
-    
-    for(int i = 0; i<625; i++){
-        if(strlen(printout[i]) == 80)
-            printf("%s\n", printout[i]);
-        else {
-            printf("%s\n", printout[i]);
-            break;
+                outputFile(argv[4]);
         }
     }
-    
+
+    //create all four threads then join them when it is done running
+    pthread_t Input, Newline, Plus, Format; 
+
+    pthread_create(&Input, NULL, &getInput, NULL);
+    pthread_create(&Newline, NULL, &replaceNewline, NULL);
+    pthread_create(&Plus, NULL, &replaceplusplus, NULL);
+    pthread_create(&Format, NULL, &formatLines, NULL);
+
+    pthread_join(Input, NULL);
+    pthread_join(Newline, NULL);
+    pthread_join(Plus, NULL);
+    pthread_join(Format, NULL);
+
 }
